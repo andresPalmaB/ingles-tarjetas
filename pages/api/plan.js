@@ -7,16 +7,15 @@ export default function handler(req, res) {
         const maxOrd = parseInt(maxOrden, 10) || 999999;
         const excludeSet = new Set((exclude || '').split(',').filter(Boolean));
 
-        // Filtro base por orden y exclusiones
+        // Usamos 'orden' como ID estable
         const pool = (Array.isArray(data) ? data : data.items || [])
             .filter(x => (x?.orden || 0) <= maxOrd)
-            .filter(x => !excludeSet.has(String(x?.id)));
+            .filter(x => !excludeSet.has(String(x?.orden)));
 
-        // Toma primeras 'lim' (luego afinamos aleatoriedad/espaciado)
         const pick = pool.slice(0, lim);
-
         res.status(200).json({ ok: true, items: pick });
     } catch (e) {
         res.status(500).json({ ok: false, error: e?.message || 'error' });
     }
 }
+

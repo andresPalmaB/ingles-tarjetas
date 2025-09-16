@@ -1,746 +1,274 @@
-import { useEffect, useState, useRef } from 'react';
-import { seedIfNeeded } from '../lib/seed-idb';
-import { getPlanDelDiaLocal } from '../lib/repo-local/plan-dia';
-import { responderLocal } from '../lib/repo-local/responder';
-import { getConfig as getCfgLocal, setConfig as setCfgLocal } from '../lib/idb';
-import { exportAvance, importAvanceFromFile, resetLocal } from '../lib/backup';
+import { useEffect, useMemo, useState } from 'react';
+import Head from 'next/head';
 
-// ========= Helpers de fecha/progreso por día (America/Bogota) =========
-const PROGRESS_KEY = 'progressByDay';
-const SESSION_KEY = 'sessionPhrasesByDay';
-const SNAPSHOT_KEY = 'studySessionSnapshot';
-
-function getDayIdBogota(date = new Date()) {
-  const fmt = new Intl.DateTimeFormat('en-CA', {
-    timeZone: 'America/Bogota',
-    year: 'numeric',
-    month: '2-digit',
-    day: '2-digit',
-  });
-  return fmt.format(date); // YYYY-MM-DD
-}
-
-function loadDoneToday() {
-  if (typeof window === 'undefined') return 0;
-  const dayId = getDayIdBogota();
-  const all = JSON.parse(localStorage.getItem(PROGRESS_KEY) || '{}');
-  return all[dayId] || 0;
-}
-function incDoneToday(delta = 1) {
-  const dayId = getDayIdBogota();
-  const all = JSON.parse(localStorage.getItem(PROGRESS_KEY) || '{}');
-  all[dayId] = (all[dayId] || 0) + delta;
-  localStorage.setItem(PROGRESS_KEY, JSON.stringify(all));
-  return all[dayId];
-}
-
-function loadSessionIds() {
-  if (typeof window === 'undefined') return [];
-  const dayId = getDayIdBogota();
-  const all = JSON.parse(localStorage.getItem(SESSION_KEY) || '{}');
-  return all[dayId] || [];
-}
-function addSessionId(id) {
-  const dayId = getDayIdBogota();
-  const all = JSON.parse(localStorage.getItem(SESSION_KEY) || '{}');
-  const set = new Set(all[dayId] || []);
-  set.add(String(id));
-  all[dayId] = Array.from(set);
-  localStorage.setItem(SESSION_KEY, JSON.stringify(all));
-}
-function ensureSessionBucket() {
-  const dayId = getDayIdBogota();
-  const all = JSON.parse(localStorage.getItem(SESSION_KEY) || '{}');
-  if (!all[dayId]) {
-    all[dayId] = [];
-    localStorage.setItem(SESSION_KEY, JSON.stringify(all));
-  }
-}
-
-// ---- Snapshot helpers ----
-function loadSnapshot() {
-  try { return JSON.parse(localStorage.getItem(SNAPSHOT_KEY) || 'null'); } catch { return null; }
-}
-function saveSnapshot(snap) {
-  try { localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(snap)); } catch {}
-}
-function clearSnapshot() {
-  try { localStorage.removeItem(SNAPSHOT_KEY); } catch {}
-}
-
-// ---- Config 100% LOCAL (IndexedDB) ----
-const leerConfig = async () => {
-  return (
-      (await getCfgLocal()) || {
-        id: 'appConfig',
-        maxOrden: 1,
-        metaDefault: 20,
-        lastPracticeDate: null,
-        practicedTodayNew: 0,
-        practicedTodayTotal: 0,
-      }
-  );
-};
-
-const guardarConfig = async (partial) => {
-  const current = (await getCfgLocal()) || {
-    id: 'appConfig',
-    maxOrden: 1,
-    metaDefault: 20,
-    lastPracticeDate: null,
-    practicedTodayNew: 0,
-    practicedTodayTotal: 0,
-  };
-  const merged = { ...current, ...partial, id: 'appConfig' };
-  await setCfgLocal(merged);
-  const updated = await getCfgLocal();
-  return { ok: true, config: updated || merged };
-};
-
-// --- Sincroniza localStorage con config (para respetar trabajo hecho hoy importado de IDB)
-function syncProgressFromConfig(cfg) {
-  try {
-    const today = getDayIdBogota();
-    if (!cfg || cfg.lastPracticeDate !== today) return;
-    const fromCfg = Number(cfg.practicedTodayTotal ?? 0);
-    const all = JSON.parse(localStorage.getItem(PROGRESS_KEY) || '{}');
-    const current = Number(all[today] || 0);
-    if (fromCfg > current) {
-      all[today] = fromCfg;
-      localStorage.setItem(PROGRESS_KEY, JSON.stringify(all));
-    }
-  } catch {}
-}
+// Storage helpers
+import { getCfgLocal, setCfgLocal, syncProgressFromConfig } from '../storage/cfg';
+import { loadDoneToday, setDoneToday } from '../storage/progress';
+import { loadSessionIds, addSessionId } from '../storage/session';
 
 export default function Home() {
-  useEffect(() => { seedIfNeeded(); }, []);
+    // --- State
+    const [cfg, setCfg] = useState({ maxOrden: 999999, metaDiariaTotal: 30, metaNuevasHoy: 10 });
+    const [hechasHoy, setHechasHoy] = useState(0);
+    const [plan, setPlan] = useState([]); // historias seleccionadas
+    const [idx, setIdx] = useState(0); // índice de historia actual
+    const [mostrarTraduccion, setMostrarTraduccion] = useState(false);
+    const [cargandoPlanDia, setCargandoPlanDia] = useState(false);
+    const current = plan[idx] || null;
 
-  // Config
-  const [config, setConfig] = useState(null);
-  const [cargandoConfig, setCargandoConfig] = useState(true);
-  const [abrirConfig, setAbrirConfig] = useState(false);
-
-  // Sesión de estudio (plan del día)
-  const [metaDia, setMetaDia] = useState(null);
-  const [maxOrden, setMaxOrden] = useState(null);
-  const [hechasHoy, setHechasHoy] = useState(0); // total hechas hoy (obligatorias + nuevas)
-  const [targetTotalHoy, setTargetTotalHoy] = useState(null); // baseDue + meta
-  const [metaNuevasHoy, setMetaNuevasHoy] = useState(null); // meta de nuevas de hoy
-  const [plan, setPlan] = useState([]);
-  const [idx, setIdx] = useState(0);
-  const [mostrarTraduccion, setMostrarTraduccion] = useState(false);
-  const [cargandoPlanDia, setCargandoPlanDia] = useState(false);
-  const [isSpeaking, setIsSpeaking] = useState(false); // bloquear botones mientras suena el audio
-  const fraseActual = plan[idx];
-
-  // Refs para auto-ajuste de texto
-  const titleBoxRef = useRef(null);
-  const titleRef = useRef(null);
-  const [titleFontPx, setTitleFontPx] = useState(28);
-
-  // Backup (import/export)
-  const [importBusy, setImportBusy] = useState(false);
-  const fileInputRef = useRef(null);
-
-  const onImportClick = () => fileInputRef.current?.click();
-  const onFileChange = async (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-    const ok = confirm('Esto reemplazará tus datos locales con los del archivo seleccionado. ¿Continuar?');
-    if (!ok) { e.target.value = ''; return; }
-    try {
-      setImportBusy(true);
-      await importAvanceFromFile(file);
-      alert('Importación completada. Se actualizaron tus datos.');
-      location.reload(); // refrescar plan/contadores
-    } catch (err) {
-      alert('Error importando: ' + err.message);
-      console.error(err);
-    } finally {
-      setImportBusy(false);
-      e.target.value = '';
-    }
-  };
-
-  // ---- Cargar config + progreso del día (todo local) ----
-  useEffect(() => {
-    (async () => {
-      try {
-        const cfg = await leerConfig();
-        setConfig(cfg);
-        if (typeof window !== 'undefined') syncProgressFromConfig(cfg);
-      } finally {
-        setCargandoConfig(false);
-        const doneLocal = loadDoneToday();
-        setHechasHoy(doneLocal);
-        ensureSessionBucket();
-      }
-    })();
-  }, []);
-
-  // ---- Auto TTS on card change ----
-  useEffect(() => {
-    try {
-      if (fraseActual?.textoIngles) {
-        if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
-        const u = new SpeechSynthesisUtterance(fraseActual.textoIngles);
-        u.lang = 'en-US';
-        setIsSpeaking(true);
-        u.onend = () => setIsSpeaking(false);
-        u.onerror = () => setIsSpeaking(false);
-        speechSynthesis.speak(u);
-      } else {
-        setIsSpeaking(false);
-      }
-    } catch {
-      setIsSpeaking(false);
-    }
-  }, [fraseActual?.textoIngles]);
-
-  // ---- Ajuste automático del tamaño del texto (encajar) ----
-  useEffect(() => {
-    const fit = () => {
-      const box = titleBoxRef.current;
-      const el = titleRef.current;
-      if (!box || !el) return;
-      const maxPx = 32;
-      const minPx = 14;
-      let size = maxPx;
-      el.style.whiteSpace = 'normal';
-      el.style.wordBreak = 'break-word';
-      el.style.hyphens = 'auto';
-      el.style.lineHeight = '1.15';
-      while (size >= minPx) {
-        el.style.fontSize = size + 'px';
-        const tooTall = el.scrollHeight > box.clientHeight;
-        const tooWide = el.scrollWidth > box.clientWidth;
-        if (!tooTall && !tooWide) break;
-        size -= 1;
-      }
-      setTitleFontPx(size);
-    };
-    const id = requestAnimationFrame(fit);
-    return () => cancelAnimationFrame(id);
-  }, [fraseActual?.textoIngles, mostrarTraduccion]);
-
-  // ---- TTS manual ----
-  const hablar = (texto) => {
-    try {
-      if (!texto) return;
-      if (typeof speechSynthesis !== 'undefined') speechSynthesis.cancel();
-      const u = new SpeechSynthesisUtterance(texto);
-      u.lang = 'en-US';
-      setIsSpeaking(true);
-      u.onend = () => setIsSpeaking(false);
-      u.onerror = () => setIsSpeaking(false);
-      speechSynthesis.speak(u);
-    } catch {
-      setIsSpeaking(false);
-    }
-  };
-
-  // ---- Snapshot: restaurar si existe para hoy ----
-  const tryRestoreSnapshot = () => {
-    const dayId = getDayIdBogota();
-    const snap = loadSnapshot();
-    if (snap && snap.dayId === dayId) {
-      setPlan(snap.plan || []);
-      setIdx(snap.idx || 0);
-      setTargetTotalHoy(snap.targetTotalHoy || 0);
-      setMetaNuevasHoy(snap.meta || 0);
-      return snap;
-    }
-    return null;
-  };
-
-  const persistSnapshot = (updater) => {
-    const dayId = getDayIdBogota();
-    const snap = loadSnapshot();
-    const base = snap && snap.dayId === dayId ? snap : { dayId, baseDueCount: 0, meta: 0, targetTotalHoy: 0, plan: [], idx: 0 };
-    const next = typeof updater === 'function' ? updater(base) : updater;
-    saveSnapshot(next);
-  };
-
-  // ---- Util para saber si una tarjeta es nueva
-  const isNuevaCard = (card) => ((card?.nivelActual ?? 0) === 0) && !card?.fechaUltimoEstudio;
-
-
-  // Fixed version of the cargarPlan function that handles post-completion meta increases
-  const cargarPlan = async (limitSolicitado, ordenMax) => {
-    setCargandoPlanDia(true);
-    try {
-      const dayId = getDayIdBogota();
-      const snap = tryRestoreSnapshot(); // también setea plan/meta/target si existía
-
-      // Si ya había snapshot y el usuario aumenta la meta -> anexar SOLO nuevas faltantes
-      if (snap && limitSolicitado && limitSolicitado > (snap.meta || 0)) {
-        const cfg = await leerConfig();
-        const practicedTotal = Number(cfg?.practicedTodayTotal || 0);
-        const practicedNew = Number(cfg?.practicedTodayNew || 0);
-
-        // Calculate the new target
-        const newTarget = Number(snap.baseDueCount || 0) + Number(limitSolicitado);
-
-        // How many new cards do we still need for the increased meta?
-        const newCardsStillNeeded = Math.max(0, limitSolicitado - practicedNew);
-
-        // Get current plan length (could be 0 if we completed the day)
-        const currentPlanLength = (snap.plan || []).length;
-
-        // If we need more new cards, fetch them
-        if (newCardsStillNeeded > 0) {
-          // Get exclusion list: everything seen today + current plan
-          const excludeIds = new Set([
-            ...loadSessionIds(),
-            ...(snap.plan || []).map(it => String(it._id)),
-          ]);
-
-          const data = await getPlanDelDiaLocal({
-            limit: limitSolicitado,
-            maxOrden: ordenMax,
-            excludeIds: Array.from(excludeIds)
-          });
-
-          // Get only new cards that we haven't seen
-          const candidates = (data?.seleccionadas || [])
-              .filter(it => !excludeIds.has(String(it._id)) && isNuevaCard(it));
-
-          // Take only the new cards we need
-          const toAdd = candidates.slice(0, newCardsStillNeeded);
-          const mergedPlan = [...(snap.plan || []), ...toAdd];
-
-          // Update state
-          setPlan(mergedPlan);
-          setIdx(snap.idx || 0);
-          setTargetTotalHoy(newTarget);
-          setMetaNuevasHoy(limitSolicitado);
-
-          // Update snapshot with new values
-          persistSnapshot({
-            ...snap,
-            meta: limitSolicitado,
-            targetTotalHoy: newTarget,
-            plan: mergedPlan,
-            idx: Math.min(snap.idx || 0, mergedPlan.length - 1)
-          });
-
-          setHechasHoy(loadDoneToday());
-          console.log(`Added ${toAdd.length} new cards. New target: ${practicedTotal}/${newTarget}, New meta: ${practicedNew}/${limitSolicitado}`);
-          return;
-        } else {
-          // We already have enough new cards practiced, just update the target
-          setPlan(snap.plan || []);
-          setIdx(snap.idx || 0);
-          setTargetTotalHoy(newTarget);
-          setMetaNuevasHoy(limitSolicitado);
-
-          persistSnapshot({
-            ...snap,
-            meta: limitSolicitado,
-            targetTotalHoy: newTarget
-          });
-
-          setHechasHoy(loadDoneToday());
-          console.log(`Meta increased but no new cards needed. Target: ${practicedTotal}/${newTarget}, Meta: ${practicedNew}/${limitSolicitado}`);
-          return;
+    // --- Load config/progress on mount
+    useEffect(() => {
+        try {
+            const local = syncProgressFromConfig(getCfgLocal());
+            setCfg(local);
+            setHechasHoy(loadDoneToday());
+        } catch (e) {
+            console.error('[index] init error', e);
         }
-      }
+    }, []);
 
-      // Si hay snapshot y NO se aumentó meta -> no tocar nada
-      if (snap) {
-        setHechasHoy(loadDoneToday());
-        return;
-      }
+    // --- Derived: remaining today
+    const remainingToday = useMemo(() => {
+        const total = parseInt(cfg?.metaDiariaTotal ?? 0, 10) || 0;
+        return Math.max(0, total - (hechasHoy | 0));
+    }, [cfg, hechasHoy]);
 
-      // 2) No había snapshot -> crear desde cero
-      const excludeIds = loadSessionIds();
-      const data = await getPlanDelDiaLocal({
-        limit: limitSolicitado,
-        maxOrden: ordenMax,
-        excludeIds,
-      });
-
-      const items = (data?.itemsLimited && data.itemsLimited.length ? data.itemsLimited : (data?.seleccionadas || []));
-      const baseDue = Number(data?.dueCount || 0);
-      const target = baseDue + Number(limitSolicitado || data?.metaNuevasSolicitadas || 0);
-
-      setPlan(items);
-      setIdx(0);
-      setMostrarTraduccion(false);
-
-      setTargetTotalHoy(target);
-      setMetaNuevasHoy(Number(limitSolicitado || data?.metaNuevasSolicitadas || 0));
-
-      // Sincronizar contadores a estado
-      setConfig((prev) => ({
-        ...(prev || {}),
-        lastPracticeDate: data?.lastPracticeDate || prev?.lastPracticeDate,
-        practicedTodayNew: Number(data?.practicedTodayNew ?? prev?.practicedTodayNew ?? 0),
-        practicedTodayTotal: Number(data?.practicedTodayTotal ?? prev?.practicedTodayTotal ?? 0),
-      }));
-
-      setHechasHoy(Number(data?.practicedTodayTotal || 0));
-
-      // Guardar snapshot base del día
-      persistSnapshot({
-        dayId,
-        baseDueCount: baseDue,
-        meta: Number(limitSolicitado || data?.metaNuevasSolicitadas || 0),
-        targetTotalHoy: target,
-        plan: items,
-        idx: 0,
-      });
-    } finally {
-      setCargandoPlanDia(false);
-    }
-  };
-
-
-  // ---- Marcar respuesta ----
-  const marcarRespuesta = async (respuesta) => {
-    if (!fraseActual) return;
-    if (isSpeaking) return; // bloquea clicks mientras suena el audio
-
-    const eraNueva = (fraseActual?.nivelActual ?? 0) === 0 && !fraseActual?.fechaUltimoEstudio;
-
-    try {
-      await responderLocal({ id: fraseActual._id, respuesta });
-    } catch (e) {
-      console.error('Error al guardar respuesta (local):', e);
+    function onCfgChange(partial) {
+        const next = { ...cfg, ...(partial || {}) };
+        setCfg(next);
+        setCfgLocal(next);
     }
 
-    if (respuesta === 'incorrecta') {
-      setPlan((prev) => {
-        const copy = [...prev];
-        const current = copy[idx];
-        copy.splice(idx, 1);
-        copy.push(current);
-        // snapshot
-        persistSnapshot(snap => ({ ...snap, plan: copy, idx: Math.min(idx, copy.length - 1) }));
-        return copy;
-      });
-      setMostrarTraduccion(false);
-      if (idx >= plan.length - 1) setIdx((i) => Math.min(i, plan.length - 1));
-      return;
+    // --- Core: cargar plan según remaining y exclusiones de sesión
+    async function cargarPlan(limitSolicitado, ordenMax) {
+        setCargandoPlanDia(true);
+        try {
+            const alreadyDone = loadDoneToday(); // persistente de hoy
+            const remaining = Math.max(0, (limitSolicitado | 0) - alreadyDone);
+
+            // Si la meta ya se cumplió no rompemos la UI, solo vaciamos plan y mostramos estado
+            if (remaining === 0) {
+                setPlan([]);
+                setIdx(0);
+                setMostrarTraduccion(false);
+                setHechasHoy(alreadyDone);
+                setCargandoPlanDia(false);
+                return;
+            }
+
+            // Excluir historias ya vistas en esta sesión (usaremos 'orden' como ID estable)
+            const excludeIds = loadSessionIds();
+            const withExclude = new URLSearchParams();
+            withExclude.set('limit', String(remaining));
+            withExclude.set('maxOrden', String(ordenMax));
+            if (excludeIds.length) withExclude.set('exclude', excludeIds.join(','));
+
+            const url = `/api/plan?${withExclude.toString()}`;
+            const resp = await fetch(url);
+            const data = await resp.json();
+            if (!data?.ok) throw new Error(data?.error || 'API plan error');
+            const items = Array.isArray(data?.items) ? data.items : [];
+
+            setPlan(items);
+            setIdx(0);
+            setMostrarTraduccion(false);
+            setHechasHoy(alreadyDone);
+        } catch (e) {
+            console.error('[index] cargarPlan error', e);
+            alert('No se pudo cargar el plan. Revisa la consola.');
+        } finally {
+            setCargandoPlanDia(false);
+        }
     }
 
-    // ✅ Correcta: contadores locales (para UX rápida)
-    const newDone = incDoneToday(1);
-    setHechasHoy(newDone);
-    if (fraseActual._id) addSessionId(fraseActual._id);
-
-    // ✅ IndexedDB (fuente de la verdad)
-    try {
-      const today = getDayIdBogota();
-      const cfg = await leerConfig();
-      if (cfg.lastPracticeDate !== today) {
-        cfg.lastPracticeDate = today;
-        cfg.practicedTodayNew = 0;
-        cfg.practicedTodayTotal = 0;
-      }
-      cfg.practicedTodayTotal = Number(cfg.practicedTodayTotal || 0) + 1;
-      if (eraNueva) cfg.practicedTodayNew = Number(cfg.practicedTodayNew || 0) + 1;
-      const saved = await guardarConfig(cfg);
-      if (saved?.config) setConfig(saved.config);
-    } catch (e) {
-      console.warn('No se pudo actualizar contadores en config:', e);
+    // --- UI handlers
+    function handleEmpezar() {
+        const total = parseInt(cfg?.metaDiariaTotal ?? 0, 10) || 0;
+        const maxOrd = parseInt(cfg?.maxOrden ?? 999999, 10) || 999999;
+        cargarPlan(total, maxOrd);
     }
 
-    setMostrarTraduccion(false);
+    function handleSiguiente() {
+        if (!current) return;
+        // Marcar hecho +1, persistir y sumar a sesión (ID por 'orden' de la historia actual)
+        const id = String(current?.orden ?? idx);
+        addSessionId(id);
+        const nuevoHechas = (loadDoneToday() | 0) + 1;
+        setDoneToday(nuevoHechas);
+        setHechasHoy(nuevoHechas);
 
-    // Avanzar y actualizar snapshot
-    setPlan((prev) => {
-      const copy = [...prev];
-      copy.splice(idx, 1); // quitar la tarjeta respondida
-      const newIdx = Math.min(idx, copy.length - 1);
-      persistSnapshot(snap => ({ ...snap, plan: copy, idx: newIdx }));
-      if (idx + 1 >= prev.length) setIdx(prev.length); else setIdx((i) => i);
-      return copy;
-    });
+        // Siguiente item del plan
+        const nextIdx = idx + 1;
+        if (nextIdx < plan.length) {
+            setIdx(nextIdx);
+            setMostrarTraduccion(false);
+        } else {
+            // Plan del día (este lote) completado
+            setPlan([]);
+            setIdx(0);
+            setMostrarTraduccion(false);
+        }
+    }
 
-    // 🚦 Parar sesión al alcanzar el objetivo total (baseDue + meta)
-    setTimeout(() => {
-      const cap = Number((loadSnapshot()?.targetTotalHoy) || targetTotalHoy || 0);
-      const done = loadDoneToday();
-      if (cap && done >= cap) {
-        setPlan([]);
-        setIdx(0);
-        // NO borramos snapshot: permite subir la meta más tarde y seguir
-        persistSnapshot(snap => ({ ...snap, plan: [], idx: 0 }));
-      }
-    }, 0);
-  };
+    function handleReiniciarSesion() {
+        // Si el usuario quiere forzar nuevas historias en esta sesión, puede refrescar la página.
+        // Aquí solo dejamos atajo visual.
+        if (confirm('Esto recargará la página para limpiar el estado de la UI.')) {
+            window.location.reload();
+        }
+    }
 
-  // ---- Pantallas ----
+    // --- Render helpers
+    function MetaInfo() {
+        const total = parseInt(cfg?.metaDiariaTotal ?? 0, 10) || 0;
+        return (
+            <div className="text-sm text-gray-300">
+                <div>Hechas hoy: <b>{hechasHoy}</b> / <b>{total}</b></div>
+                {remainingToday > 0 ? (
+                    <div>Faltan: <b>{remainingToday}</b></div>
+                ) : (
+                    <div className="text-green-400">¡Plan del día completado! 🎉</div>
+                )}
+            </div>
+        );
+    }
 
-  if (cargandoConfig) {
-    return (
-        <main className="flex items-center justify-center min-h-screen bg-gradient-to-b from-gray-900 to-gray-800 p-4 text-gray-100">
-          <div className="bg-gray-800 shadow-xl rounded-2xl p-8 max-w-md w-full text-center border border-gray-700">
-            <h1 className="text-xl font-semibold">Cargando configuración…</h1>
-          </div>
-        </main>
-    );
-  }
-
-  if (cargandoPlanDia) {
-    return (
-        <main className="flex items-center justify-center min-h-screen bg-gradient-to-b from-gray-900 to-gray-800 p-4 text-gray-100">
-          <div className="bg-gray-800 shadow-xl rounded-2xl p-8 max-w-md w-full text-center border border-gray-700">
-            <h1 className="text-xl font-semibold">Preparando tu plan de hoy…</h1>
-          </div>
-        </main>
-    );
-  }
-
-  if (metaDia === null || maxOrden === null) {
-    return (
-        <main className="flex items-center justify-center min-h-screen bg-gradient-to-b from-gray-900 to-gray-800 p-4 text-gray-100">
-          <div className="bg-gray-800 shadow-xl rounded-2xl p-8 max-w-md w-full space-y-4 border border-gray-700">
-            <h1 className="text-2xl font-bold text-center">Configura tu sesión de hoy</h1>
-
-            <form
-                onSubmit={async (e) => {
-                  e.preventDefault();
-                  const meta = parseInt(e.target.meta.value, 10);
-                  const orden = parseInt(e.target.orden.value, 10);
-                  if (!isNaN(meta) && meta > 0 && !isNaN(orden) && orden > 0) {
-                    setMetaDia(meta);
-                    setMaxOrden(orden);
-                    try {
-                      const resp = await guardarConfig({ maxOrden: orden, metaDefault: meta });
-                      if (resp?.ok) setConfig(resp.config);
-                    } catch (err) {
-                      console.warn('No se pudo guardar config por defecto (local):', err);
-                    }
-                    await cargarPlan(meta, orden);
-                  }
-                }}
-                className="space-y-3"
-            >
-              <div>
-                <label className="block text-sm text-gray-300">¿Cuántas frases hoy? (meta nuevas)</label>
-                <input
-                    name="meta"
-                    type="number"
-                    min="1"
-                    defaultValue={config?.metaDefault ?? 20}
-                    className="w-full border border-gray-600 rounded-lg p-2 bg-gray-700 text-gray-100"
-                />
-              </div>
-
-              <div>
-                <label className="block text-sm text-gray-300">¿Hasta qué historia vas? (maxOrden)</label>
-                <input
-                    name="orden"
-                    type="number"
-                    min="1"
-                    defaultValue={config?.maxOrden ?? 1}
-                    className="w-full border border-gray-600 rounded-lg p-2 bg-gray-700 text-gray-100"
-                />
-              </div>
-
-              <button className="w-full bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">
-                Empezar
-              </button>
-            </form>
-
-            <button
-                type="button"
-                onClick={() => setAbrirConfig((v) => !v)}
-                className="w-full bg-gray-700 text-gray-100 px-4 py-2 rounded-lg hover:bg-gray-600"
-            >
-              ⚙️ Configurar</button>
-
-            {abrirConfig && config && (
-                <div className="mt-4 border border-gray-700 rounded-lg p-4 bg-gray-800">
-                  <h2 className="font-semibold mb-2 text-gray-100">Configuración</h2>
-                  <form
-                      onSubmit={async (e) => { e.preventDefault(); const maxOrdenNuevo = parseInt(e.target.maxOrden.value, 10); const resp = await guardarConfig({ maxOrden: maxOrdenNuevo, }); setConfig(resp.config); setAbrirConfig(false); }}
-                      className="space-y-3"
-                  >
-                    <div>
-                      <label className="block text-sm text-gray-300">Por cual Historia vas:</label>
-                      <input
-                          name="maxOrden"
-                          type="number"
-                          min="1"
-                          defaultValue={config.maxOrden}
-                          className="w-full border border-gray-600 rounded-lg p-2 bg-gray-700 text-gray-100"
-                      />
+    function HistoriaCard({ item }) {
+        if (!item) return null;
+        const frases = Array.isArray(item.frases) ? item.frases : [];
+        const primera = frases[0] || null;
+        return (
+            <div className="border border-gray-700 rounded-2xl p-4 bg-gray-900 shadow">
+                <div className="text-xs uppercase tracking-wide text-gray-400">Historia #{item.orden ?? '-'}</div>
+                <h2 className="text-xl font-semibold text-gray-100 mb-2">{item.titulo || '—'}</h2>
+                {primera ? (
+                    <div className="mt-3">
+                        <p className="text-gray-100 text-lg">{primera.textoIngles}</p>
+                        {mostrarTraduccion && (
+                            <p className="text-gray-300 mt-2">{primera.traduccion}</p>
+                        )}
                     </div>
-
-                    <div className="flex gap-2">
-                      <button className="bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700">
-                        Guardar
-                      </button>
-                      <button
-                          type="button"
-                          onClick={() => setAbrirConfig(false)}
-                          className="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-100"
-                      >
-                        Cancelar
-                      </button>
-                    </div>
-                  </form>
-
-                  {/* Herramientas de respaldo de avance */}
-                  <div className="mt-4 p-3 rounded-lg border border-gray-700 bg-gray-900/60">
-                    <h3 className="font-semibold mb-2 text-gray-100">Respaldo y traslado de avance</h3>
-                    <div className="flex flex-col gap-2">
-                      <button
-                          type="button"
-                          onClick={() => exportAvance()}
-                          className="w-full bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg"
-                      >
-                        ⬇️ Exportar avance (JSON)
-                      </button>
-
-                      <button
-                          type="button"
-                          disabled={importBusy}
-                          onClick={onImportClick}
-                          className="w-full bg-cyan-600 hover:bg-cyan-700 disabled:opacity-60 text-white px-4 py-2 rounded-lg"
-                      >
-                        ⬆️ Importar avance (JSON)
-                      </button>
-
-                      <button
-                          type="button"
-                          onClick={async () => {
-                            const ok = confirm('Esto borrará todo tu avance local y reiniciará la app. ¿Seguro?');
-                            if (!ok) return;
-                            await resetLocal();
-                            try {
-                              localStorage.removeItem(PROGRESS_KEY);
-                              localStorage.removeItem(SESSION_KEY);
-                              clearSnapshot();
-                            } catch {}
-                            location.reload();
-                          }}
-                          className="w-full bg-gray-700 hover:bg-gray-600 text-gray-100 px-4 py-2 rounded-lg"
-                      >
-                        🗑️ Reset de fábrica
-                      </button>
-                    </div>
-                    <p className="text-xs text-gray-400 mt-2">
-                      Exporta tu avance para llevarlo a otra máquina. En la otra máquina, abre la app, ve a “Configurar” y usa “Importar avance (JSON)”.
-                    </p>
-                  </div>
-
-                  {/* Input oculto para importar */}
-                  <input
-                      ref={fileInputRef}
-                      type="file"
-                      accept="application/json"
-                      onChange={onFileChange}
-                      style={{ display: 'none' }}
-                  />
+                ) : (
+                    <p className="text-gray-400">Sin frases en esta historia.</p>
+                )}
+                <div className="mt-4 flex gap-2">
+                    <button
+                        type="button"
+                        onClick={() => setMostrarTraduccion(v => !v)}
+                        className="px-4 py-2 rounded-xl bg-gray-700 text-gray-100 hover:bg-gray-600"
+                    >
+                        {mostrarTraduccion ? 'Ocultar traducción' : 'Mostrar traducción'}
+                    </button>
+                    <button
+                        type="button"
+                        onClick={handleSiguiente}
+                        className="px-4 py-2 rounded-xl bg-blue-600 text-white hover:bg-blue-500"
+                    >
+                        Siguiente
+                    </button>
                 </div>
-            )}
+            </div>
+        );
+    }
 
-            <p className="text-xs text-gray-400">
-              Solo se tomarán frases que “toquen hoy” (revisarEnFecha ≤ hoy) y de historias con orden ≤ al que indiques.
-            </p>
-          </div>
-        </main>
-    );
-  }
-
-  // Completado: solo si NO estamos cargando y no hay frase actual (plan vacío)
-  if (!fraseActual && !cargandoPlanDia) {
     return (
-        <main className="flex items-center justify-center min-h-screen bg-gradient-to-b from-gray-900 to-gray-800 p-4 text-gray-100">
-          <div className="bg-gray-800 shadow-xl rounded-2xl p-8 max-w-lg w-full text-center border border-gray-700">
-            <h1 className="text-2xl font-bold">¡Plan del día completado! 🎉</h1>
-            <p className="text-gray-300 mt-2">
-              Hechas hoy: <strong>{config?.practicedTodayNew ?? 0}</strong> / {metaNuevasHoy ?? 0}
-            </p>
-            <div className="mt-6 flex justify-center gap-3">
-              <button
-                  onClick={() => { setMetaDia(null); setMaxOrden(null); setPlan([]); setIdx(0); }}
-                  className="px-4 py-2 rounded-lg bg-gray-700 hover:bg-gray-600 text-gray-100"
-              >
-                Nueva sesión
-              </button>
-            </div>
-          </div>
-        </main>
-    );
-  }
+        <>
+            <Head>
+                <title>Inglés - Tarjetas</title>
+                <meta name="viewport" content="width=device-width, initial-scale=1" />
+            </Head>
+            <main className="min-h-screen bg-black text-gray-100">
+                <div className="max-w-3xl mx-auto p-4 md:p-8 space-y-6">
+                    <header className="flex items-center justify-between">
+                        <h1 className="text-2xl md:text-3xl font-bold">Tarjetas de Estudio</h1>
+                        <button
+                            type="button"
+                            onClick={handleReiniciarSesion}
+                            className="px-3 py-2 rounded-xl bg-gray-800 hover:bg-gray-700 text-sm"
+                        >
+                            Refrescar
+                        </button>
+                    </header>
 
-  // Tarjeta de estudio (462x378; si hay traducción, puede crecer)
-  const containerBase = "bg-gray-800 shadow-xl rounded-2xl p-4 border border-gray-700 w-[462px]";
-  const containerClass = mostrarTraduccion ? (containerBase + " min-h-[378px]") : (containerBase + " h-[378px]");
+                    <section className="grid gap-4 md:grid-cols-3">
+                        <div className="col-span-2 space-y-4">
+                            <div className="border border-gray-800 rounded-2xl p-4 bg-gray-950">
+                                <div className="grid gap-3 md:grid-cols-3">
+                                    <label className="block">
+                                        <span className="block text-sm text-gray-300">Max orden</span>
+                                        <input
+                                            type="number"
+                                            min={1}
+                                            defaultValue={cfg.maxOrden}
+                                            onChange={(e) => onCfgChange({ maxOrden: parseInt(e.target.value || '0', 10) || 1 })}
+                                            className="w-full mt-1 px-3 py-2 rounded-lg bg-gray-900 border border-gray-800 text-gray-100"
+                                        />
+                                    </label>
+                                    <label className="block">
+                                        <span className="block text-sm text-gray-300">Meta diaria total</span>
+                                        <input
+                                            type="number"
+                                            min={1}
+                                            defaultValue={cfg.metaDiariaTotal}
+                                            onChange={(e) => onCfgChange({ metaDiariaTotal: Math.max(1, parseInt(e.target.value || '0', 10) || 1) })}
+                                            className="w-full mt-1 px-3 py-2 rounded-lg bg-gray-900 border border-gray-800 text-gray-100"
+                                        />
+                                    </label>
+                                    <label className="block">
+                                        <span className="block text-sm text-gray-300">Nuevas hoy</span>
+                                        <input
+                                            type="number"
+                                            min={0}
+                                            defaultValue={cfg.metaNuevasHoy}
+                                            onChange={(e) => onCfgChange({ metaNuevasHoy: Math.max(0, parseInt(e.target.value || '0', 10) || 0) })}
+                                            className="w-full mt-1 px-3 py-2 rounded-lg bg-gray-900 border border-gray-800 text-gray-100"
+                                        />
+                                    </label>
+                                </div>
+                                <div className="mt-4 flex items-center justify-between">
+                                    <MetaInfo />
+                                    <button
+                                        type="button"
+                                        onClick={handleEmpezar}
+                                        disabled={cargandoPlanDia}
+                                        className="px-4 py-2 rounded-xl bg-emerald-600 text-white hover:bg-emerald-500 disabled:opacity-50"
+                                    >
+                                        {cargandoPlanDia ? 'Cargando...' : 'Empezar'}
+                                    </button>
+                                </div>
+                            </div>
 
-  return (
-      <main className="flex items-center justify-center min-h-screen bg-gradient-to-b from-gray-900 to-gray-800 p-4 text-gray-100">
-        <div className={containerClass + " flex flex-col"}>
-          {/* Contadores superiores */}
-          <div className="w-full flex justify-between text-[11px] text-gray-300 mb-1">
-            <span>Trabajar hoy: {hechasHoy}/{targetTotalHoy ?? "…"}</span>
-            <span>Nuevas hoy: {config?.practicedTodayNew ?? 0}/{metaNuevasHoy ?? 0}</span>
-          </div>
+                            {current ? (
+                                <HistoriaCard item={current} />
+                            ) : (
+                                <div className="border border-gray-800 rounded-2xl p-6 text-gray-300 bg-gray-950">
+                                    {remainingToday > 0
+                                        ? 'Presiona “Empezar” para cargar tu plan de hoy.'
+                                        : '¡Plan del día completado! Puedes aumentar la meta diaria si quieres practicar más.'}
+                                </div>
+                            )}
+                        </div>
 
-          {/* Área de texto principal con auto-fit */}
-          <div ref={titleBoxRef} className="flex-1 overflow-hidden flex items-center justify-center text-center px-2">
-            <h2
-                ref={titleRef}
-                style={{ fontSize: `${titleFontPx}px`, lineHeight: 1.15 }}
-                className="font-semibold text-blue-400 break-words"
-            >
-              {fraseActual?.textoIngles}
-              { (fraseActual && ((fraseActual.nivelActual ?? 0) === 0) && !fraseActual.fechaUltimoEstudio) && (
-                  <span className="ml-2 text-[10px] px-2 py-0.5 rounded-full border border-amber-400 text-amber-300">Nueva</span>
-              ) }
-            </h2>
-          </div>
-
-          {/* Controles */}
-          <div className="mt-2 flex flex-col gap-2">
-            <div className="flex justify-center">
-              <button
-                  onClick={() => fraseActual?.textoIngles && hablar(fraseActual.textoIngles)}
-                  disabled={isSpeaking}
-                  className="bg-blue-600 text-white px-4 py-1.5 rounded-lg hover:bg-blue-700 transition disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                🔊 Escuchar
-              </button>
-            </div>
-
-            <div className="flex justify-center">
-              <button
-                  onClick={() => setMostrarTraduccion(!mostrarTraduccion)}
-                  className="text-xs text-blue-400 underline"
-              >
-                {mostrarTraduccion ? 'Ocultar traducción' : 'Mostrar traducción'}
-              </button>
-            </div>
-
-            {mostrarTraduccion && (
-                <div className="text-sm text-center text-gray-200 bg-gray-700 p-2 rounded w-full max-h-28 overflow-auto">
-                  {fraseActual?.traduccion}
+                        <aside className="space-y-4">
+                            <div className="border border-gray-800 rounded-2xl p-4 bg-gray-950">
+                                <h3 className="font-semibold mb-2">Plan actual</h3>
+                                {plan.length > 0 ? (
+                                    <ul className="text-sm text-gray-300 space-y-1 max-h-64 overflow-auto pr-2">
+                                        {plan.map((h, i) => (
+                                            <li key={`${h.orden}-${i}`} className={i === idx ? 'text-white' : ''}>
+                                                {i === idx ? '→ ' : ''}
+                                                #{h.orden ?? '-'} — {h.titulo ?? '—'}
+                                            </li>
+                                        ))}
+                                    </ul>
+                                ) : (
+                                    <p className="text-gray-400 text-sm">Sin elementos cargados.</p>
+                                )}
+                            </div>
+                        </aside>
+                    </section>
                 </div>
-            )}
-
-            <div className="flex justify-between w-full mt-1 gap-2">
-              <button
-                  onClick={() => marcarRespuesta('incorrecta')}
-                  disabled={isSpeaking}
-                  className="bg-red-600 text-white px-4 py-2 rounded-lg hover:bg-red-700 w-1/2 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                ❌ No la entendí
-              </button>
-              <button
-                  onClick={() => marcarRespuesta('correcta')}
-                  disabled={isSpeaking}
-                  className="bg-green-600 text-white px-4 py-2 rounded-lg hover:bg-green-700 w-1/2 disabled:opacity-50 disabled:cursor-not-allowed"
-              >
-                ✅ La entendí
-              </button>
-            </div>
-          </div>
-        </div>
-      </main>
-  );
+            </main>
+        </>
+    );
 }
