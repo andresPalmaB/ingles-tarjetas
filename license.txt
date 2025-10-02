@@ -1,0 +1,16 @@
+AVISO IMPORTANTE SOBRE SEGURIDAD DE WINDOWS
+
+Durante la instalación, Windows puede mostrar advertencias de seguridad o una pantalla roja indicando que este software "no es reconocido" o "puede ser peligroso".
+
+ESTO ES NORMAL para aplicaciones que no están firmadas digitalmente.
+
+✅ ESTA APLICACIÓN ES SEGURA
+✅ NO CONTIENE VIRUS NI MALWARE
+✅ ES SEGURO HACER CLICK EN "EJECUTAR DE TODOS MODOS"
+
+Si Windows bloquea la instalación:
+1. Click en "Más información"
+2. Click en "Ejecutar de todos modos"
+3. O ejecute como Administrador
+
+Esta aplicación instala un servidor local de Node.js para ejecutar la aplicación de Inglés Tarjetas de forma offline.

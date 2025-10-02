@@ -1,0 +1,46 @@
+=========================================
+       INGLES TARJETAS v1.0.10
+       Aplicación Portable
+=========================================
+
+INSTRUCCIONES DE USO:
+
+1. DESCOMPRIME este archivo ZIP en cualquier carpeta de tu computadora
+   Ejemplo: C:\MisAplicaciones\InglesTarjetas\
+
+2. EJECUTA el archivo "iniciar.bat" haciendo doble clic
+
+3. ESPERA a que se abra tu navegador web automáticamente
+   (Si no se abre, ve manualmente a: http://localhost:5173)
+
+4. ¡Listo! Ya puedes usar la aplicación
+
+PARA CERRAR LA APLICACIÓN:
+- Cierra la ventana negra que dice "Ingles Tarjetas - Iniciando..."
+- O presiona Ctrl+C en esa ventana
+
+REQUISITOS:
+- Windows 7 o superior
+- Navegador web moderno (Chrome, Firefox, Edge)
+
+PROBLEMAS COMUNES:
+
+Si Windows bloquea la aplicación:
+1. Click derecho en "iniciar.bat"
+2. Selecciona "Ejecutar como administrador"
+3. O agrega la carpeta completa como excepción en Windows Security
+
+Si aparece "puerto ocupado":
+1. Cierra todas las ventanas del navegador
+2. Ejecuta iniciar.bat nuevamente
+
+CONTACTO:
+Si tienes problemas, verifica que todos los archivos estén en la misma carpeta:
+- iniciar.bat
+- server.cjs
+- carpeta "node" (con node.exe dentro)
+- carpeta "out" (con los archivos web)
+
+Esta es una aplicación offline que funciona completamente en tu computadora.
+No se envía información a internet.
+=========================================
