@@ -430,12 +430,14 @@ export default function AppUI() {
             const responderYaSumoNew = afterNew > beforeNew;
             const responderYaSumoTot = afterTot > beforeTot;
 
-            // 🔄 SIEMPRE refleja IDB en UI (evita “optimista” en nuevas)
+            // 🔄 SIEMPRE refleja IDB en UI
             setConfig(cfgAfter);
 
-            // (mantén tu UX rápida de “Trabajar hoy”)
-            const newDone = incDoneToday(1);
-            setHechasHoy(newDone);
+            // Solo contar como "hecha" si fue correcta
+            if (respuesta === 'correcta') {
+                const newDone = incDoneToday(1);
+                setHechasHoy(newDone);
+            }
             if (fraseActual._id) addSessionId(fraseActual._id);
 
             // Si responderLocal NO sumó, suma tú en IDB y luego refleja UNA sola vez
