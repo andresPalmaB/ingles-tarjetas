@@ -437,8 +437,8 @@ export default function AppUI() {
             if (respuesta === 'correcta') {
                 const newDone = incDoneToday(1);
                 setHechasHoy(newDone);
+                if (fraseActual._id) addSessionId(fraseActual._id);
             }
-            if (fraseActual._id) addSessionId(fraseActual._id);
 
             // Si responderLocal NO sumó, suma tú en IDB y luego refleja UNA sola vez
             if (!responderYaSumoTot || (eraNueva && !responderYaSumoNew)) {
